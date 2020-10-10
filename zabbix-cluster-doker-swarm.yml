@@ -1,0 +1,205 @@
+version: '3.8'
+services:
+ zabbix-server:
+  image: zabbix/zabbix-server-mysql:alpine-5.0-latest
+  ports:
+   - "10051:10051"
+  volumes:
+   - /etc/localtime:/etc/localtime:ro
+   - /etc/timezone:/etc/timezone:ro
+   - /zbx_env/usr/lib/zabbix/alertscripts:/usr/lib/zabbix/alertscripts:ro
+   - /zbx_env/usr/lib/zabbix/externalscripts:/usr/lib/zabbix/externalscripts:ro
+   - /zbx_env/var/lib/zabbix/export:/var/lib/zabbix/export:rw
+   - /zbx_env/var/lib/zabbix/modules:/var/lib/zabbix/modules:ro
+   - /zbx_env/var/lib/zabbix/enc:/var/lib/zabbix/enc:ro
+   - /zbx_env/var/lib/zabbix/ssh_keys:/var/lib/zabbix/ssh_keys:ro
+   - /zbx_env/var/lib/zabbix/mibs:/var/lib/zabbix/mibs:ro
+   - snmptraps:/var/lib/zabbix/snmptraps:rw
+  env_file:
+   - /opt/zabbix-container/zabbix-docker/.env_db_mysql
+   - /opt/zabbix-container/zabbix-docker/.env_srv
+  deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+  secrets:
+   - MYSQL_USER
+   - MYSQL_PASSWORD
+   - MYSQL_ROOT_PASSWORD
+#   - client-key.pem
+#   - client-cert.pem
+#   - root-ca.pem
+  depends_on:
+   - mysql-server
+   - zabbix-java-gateway
+   - zabbix-snmptraps
+  networks:
+   zbx_net_backend:
+     aliases:
+      - zabbix-server
+      - zabbix-server-mysql
+      - zabbix-server-alpine-mysql
+      - zabbix-server-mysql-alpine
+   zbx_net_frontend:
+  stop_grace_period: 30s
+  sysctls:
+   - net.ipv4.ip_local_port_range=1024 65000
+   - net.ipv4.conf.all.accept_redirects=0
+   - net.ipv4.conf.all.secure_redirects=0
+   - net.ipv4.conf.all.send_redirects=0
+  labels:
+   com.zabbix.description: "Zabbix server with MySQL database support"
+   com.zabbix.company: "Zabbix LLC"
+   com.zabbix.component: "zabbix-server"
+   com.zabbix.dbtype: "mysql"
+   com.zabbix.os: "alpine"
+
+ nginx:
+  image: zabbix/zabbix-web-nginx-mysql:alpine-5.0-latest
+  ports:
+   - "80:8080"
+   - "443:8443"
+  volumes:
+   - /etc/localtime:/etc/localtime:ro
+   - /etc/timezone:/etc/timezone:ro
+   - /zbx_env/etc/ssl/nginx:/etc/ssl/nginx:ro
+   - /zbx_env/usr/share/zabbix/modules/:/usr/share/zabbix/modules/:ro
+  env_file:
+   - /opt/zabbix-container/zabbix-docker/.env_db_mysql
+   - /opt/zabbix-container/zabbix-docker/.env_web
+  deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+  secrets:
+   - MYSQL_USER
+   - MYSQL_PASSWORD
+#   - client-key.pem
+#   - client-cert.pem
+#   - root-ca.pem
+  depends_on:
+   - mysql-server
+   - zabbix-server
+  healthcheck:
+   test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+   interval: 10s
+   timeout: 5s
+   retries: 3
+   start_period: 30s
+  networks:
+   zbx_net_backend:
+    aliases:
+     - zabbix-web-nginx-mysql
+     - zabbix-web-nginx-alpine-mysql
+     - zabbix-web-nginx-mysql-alpine
+   zbx_net_frontend:
+  stop_grace_period: 10s
+  sysctls:
+   - net.core.somaxconn=65535
+  labels:
+   com.zabbix.description: "Zabbix frontend on Nginx web-server with MySQL database support"
+   com.zabbix.company: "Zabbix LLC"
+   com.zabbix.component: "zabbix-frontend"
+   com.zabbix.webserver: "nginx"
+   com.zabbix.dbtype: "mysql"
+   com.zabbix.os: "alpine"
+
+ dbclient:
+     image: alpine:latest
+     environment:
+       - BACKUP_ENABLED=1
+       - BACKUP_INTERVAL=60
+       - BACKUP_PATH=/data
+       - BACKUP_FILENAME=db_backup
+     networks:
+       - zbx_net_backend
+     entrypoint: |
+       sh -c 'sh -s << EOF
+         apk add --no-cache mysql-client
+         while true
+          do
+           if [ $$BACKUP_ENABLED == 1 ]
+             then
+               sleep $$BACKUP_INTERVAL
+               mkdir -p $$BACKUP_PATH/$$(date +%F)
+               echo "$$(date +%FT%H.%m) - Making Backup to : $$BACKUP_PATH/$$(date +%F)/$$BACKUP_FILENAME-$$(date +%FT%H.%m).sql.gz"
+               mysqldump -u root -proot_pwd_sb -h dblb --all-databases | gzip > $$BACKUP_PATH/$$(date +%F)/$$BACKUP_FILENAME-$$(date +%FT%H.%m).sql.gz
+               find $$BACKUP_PATH -mtime 7 -delete
+           fi
+          done
+        EOF'
+     volumes:
+       - vol_dbclient:/data
+     deploy:
+       mode: replicated
+       replicas: 1
+
+# dblb:
+#    image: toughiq/maxscale:latest
+#    networks:
+#       - zbx_net_backend
+#    ports:
+#      - 3306:3306
+#    environment:
+#      - DB_SERVICE_NAME=mysql-server
+#      - ENABLE_ROOT_USER=1
+#    deploy:
+#      mode: replicated
+#      replicas: 1
+
+ mysql-server:
+     image: toughiq/mariadb-cluster:10.4
+     networks:
+       - zbx_net_backend
+     env_file:
+       - /opt/zabbix-container/zabbix-docker/.env_db_mysql
+#     environment:
+#       - DB_SERVICE_NAME=mysql-server
+#       - MYSQL_ROOT_PASSWORD=root_pwd_sb
+#       - MYSQL_DATABASE=zabbix
+#       - MYSQL_USER=sbzabbix
+#       - MYSQL_PASSWORD=sbzabbix
+     deploy:
+       mode: replicated
+       replicas: 1
+     secrets:
+        - MYSQL_USER
+        - MYSQL_PASSWORD
+        - MYSQL_ROOT_PASSWORD
+
+
+volumes:
+  snmptraps:
+  vol_dbclient:
+
+networks:
+  zbx_net_frontend:
+    driver: overlay
+    driver_opts:
+      com.docker.network.enable_ipv6: "false"
+  zbx_net_backend:
+    driver: overlay
+    driver_opts:
+      com.docker.network.enable_ipv6: "false"
+#      external: true
+
+
+secrets:
+  MYSQL_USER:
+    file: /opt/zabbix-container/zabbix-docker/.MYSQL_USER
+  MYSQL_PASSWORD:
+    file: /opt/zabbix-container/zabbix-docker/.MYSQL_PASSWORD
+  MYSQL_ROOT_PASSWORD:
+    file: /opt/zabbix-container/zabbix-docker/.MYSQL_ROOT_PASSWORD
+#  client-key.pem:
+#    file: ./.ZBX_DB_KEY_FILE
+#  client-cert.pem:
+#    file: ./.ZBX_DB_CERT_FILE
+#  root-ca.pem:
+#    file: ./.ZBX_DB_CA_FILE
+#  server-cert.pem:
+#    file: ./.DB_CERT_FILE
+#  server-key.pem:
+#    file: ./.DB_KEY_FILE
